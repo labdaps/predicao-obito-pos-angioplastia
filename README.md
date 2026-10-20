@@ -21,6 +21,7 @@ system. The scripts expect, in a `dados/` folder that is not versioned, one row 
 | `23_figuras_paper.py` | Manuscript figures |
 | `24_shap_catboost.py` | Exact TreeSHAP for CatBoost, after checking that the refitted model reproduces the original predictions |
 | `25_subgrupos_ic.py` | Bootstrap confidence intervals by sex and age group |
+| `26_escore_mayo.py` | Published Mayo Clinic Risk Score for in-hospital death (points and nomogram cut-offs from Singh et al. 2007) |
 
 ## Design in brief
 

@@ -29,12 +29,16 @@ OUT.mkdir(exist_ok=True)
 SEMENTE, LIMIAR = 20260929, 0.0264
 
 EN = {"Regressão logística": "Logistic regression", "Gradient boosting": "Gradient boosting", "XGBoost": "XGBoost",
-      "CatBoost": "CatBoost", "TabPFN": "TabPFN", "Kumo Tabular": "Kumo Tabular", "CathPCI (escore publicado)": "Published CathPCI score"}
+      "CatBoost": "CatBoost", "TabPFN": "TabPFN", "Kumo Tabular": "Kumo Tabular", "CathPCI (escore publicado)": "Published CathPCI score",
+      "Mayo (escore publicado)": "Published Mayo score"}
+ESCORES = ["CathPCI (escore publicado)", "Mayo (escore publicado)"]
 ORDEM = ["Regressão logística", "Gradient boosting", "XGBoost", "CatBoost", "TabPFN", "Kumo Tabular"]
 COR = dict(zip(ORDEM, ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#6250d6"]))
 COR["CathPCI (escore publicado)"] = "#3a3a38"
+COR["Mayo (escore publicado)"] = "#8f8e88"
 ESTILO = dict(zip(ORDEM, ["-", "--", "-.", ":", "-", "--"]))
 ESTILO["CathPCI (escore publicado)"] = (0, (1, 1.5))
+ESTILO["Mayo (escore publicado)"] = (0, (5, 1.5, 1, 1.5))
 TINTA, TINTA2, GRADE = "#1f1f1e", "#5f5e58", "#e6e5e0"
 
 plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 9, "axes.edgecolor": TINTA2, "axes.labelcolor": TINTA,
@@ -47,6 +51,9 @@ assert (pr["id"].to_numpy() == cp["id"].to_numpy()).all()
 y = pr["obito_30d"].to_numpy().astype(int)          # coluna com o desfecho da análise (óbito na internação, até 30 dias)
 P = {m: pr[m].to_numpy() for m in ORDEM}
 P["CathPCI (escore publicado)"] = cp["CathPCI (escore publicado)"].to_numpy()
+my = pd.read_csv(G / "resultados_mayo" / "probs_mayo_publicado.csv").set_index("id").loc[pr["id"]]   # 26_escore_mayo.py
+assert (my["obito_30d"].to_numpy() == pr["obito_30d"].to_numpy()).all()
+P["Mayo (escore publicado)"] = my["Mayo (escore publicado)"].to_numpy()
 n, ev = len(y), int(y.sum())
 IC = pd.read_csv(G / "bootstrap" / "ic95_metricas.csv")
 IC = IC[IC["Avaliação"] == "teste inteiro"]
@@ -70,7 +77,7 @@ fig.savefig(OUT / "fig1_fluxo.png", bbox_inches="tight"); plt.close(fig)
 
 # ---------------------------------------------------------------- Figura 2: ROC e precision-recall
 fig, (a1, a2) = plt.subplots(1, 2, figsize=(10, 4.9))
-for m in ORDEM + ["CathPCI (escore publicado)"]:
+for m in ORDEM + ESCORES:
     fpr, tpr, _ = roc_curve(y, P[m])
     a1.plot(fpr, tpr, color=COR[m], ls=ESTILO[m], lw=1.6 if m in ORDEM else 1.4, label=f"{EN[m]} ({roc_auc_score(y, P[m]):.3f})")
     prec, rec, _ = precision_recall_curve(y, P[m])
@@ -125,16 +132,17 @@ for ax, met in zip(eixos, ["AUROC", "AUPRC"]):
             r = IC[(IC["Parte"] == parte) & (IC["Modelo"] == m)].iloc[0]
             xs.append(i + desloc[k]); vs.append(r[met]); los.append(r[met] - r[f"{met} inf"]); his.append(r[f"{met} sup"] - r[met])
         ax.errorbar(xs, vs, yerr=[los, his], fmt="o", ms=5, color=COR[m], ecolor=COR[m], elinewidth=1.2, capsize=0, label=EN[m])
-    r = IC[(IC["Parte"] == "cathpci") & (IC["Modelo"] == "CathPCI (escore publicado)")].iloc[0]
-    ax.axhline(r[met], color=COR["CathPCI (escore publicado)"], lw=1, ls=ESTILO["CathPCI (escore publicado)"])
-    ax.text(2.45, r[met], " Published\n CathPCI score", fontsize=7.5, va="center", color=TINTA2)
+    for esc, parte in [("CathPCI (escore publicado)", "cathpci"), ("Mayo (escore publicado)", "mayo")]:
+        r = IC[(IC["Parte"] == parte) & (IC["Modelo"] == esc)].iloc[0]
+        ax.axhline(r[met], color=COR[esc], lw=1.2, ls=ESTILO[esc], label=EN[esc])
     if met == "AUPRC":
-        ax.axhline(y.mean(), color=TINTA2, lw=0.8, ls=(0, (4, 3))); ax.text(2.45, y.mean(), " Prevalence", fontsize=7.5, va="center", color=TINTA2)
+        ax.axhline(y.mean(), color=TINTA2, lw=0.8, ls=(0, (4, 3))); ax.text(2.45, y.mean() + 0.004, " Prevalence", fontsize=7.5, va="bottom", color=TINTA2)
     ax.set_xticks(range(len(CONJ))); ax.set_xticklabels([c[1] for c in CONJ]); ax.set_xlim(-0.5, 3.25)
     ax.set_ylabel(f"{met} (95% CI)"); ax.grid(axis="x", visible=False)
     ax.set_title(("A  " if met == "AUROC" else "B  ") + met, loc="left", fontsize=10, color=TINTA)
-eixos[0].legend(loc="upper left", fontsize=7.5)
-fig.tight_layout(); fig.savefig(OUT / "fig4_conjuntos.png"); plt.close(fig)
+h, l = eixos[0].get_legend_handles_labels()
+fig.legend(h, l, loc="lower center", ncol=4, fontsize=7.5, bbox_to_anchor=(0.5, 0.0))
+fig.tight_layout(rect=(0, 0.1, 1, 1)); fig.savefig(OUT / "fig4_conjuntos.png"); plt.close(fig)
 
 # ---------------------------------------------------------------- Figura 5: curva de decisão
 pts = np.linspace(0.005, 0.20, 196)
@@ -144,7 +152,7 @@ def nb(p, t):
 fig, ax = plt.subplots(figsize=(7, 4.6))
 ax.plot(pts * 100, [1000 * (y.mean() - (1 - y.mean()) * t / (1 - t)) for t in pts], color=TINTA2, lw=1, label="Monitor all")
 ax.axhline(0, color=TINTA, lw=0.8, label="Monitor none")
-for m in ORDEM + ["CathPCI (escore publicado)"]:
+for m in ORDEM + ESCORES:
     ax.plot(pts * 100, [1000 * nb(P[m], t) for t in pts], color=COR[m], ls=ESTILO[m], lw=1.6 if m in ORDEM else 1.4, label=EN[m])
 ax.axvline(LIMIAR * 100, color=TINTA2, lw=0.8, ls=(0, (4, 3)))
 ax.text(LIMIAR * 100 + 0.2, 33, f"{100*LIMIAR:.2f}%", fontsize=7.5, color=TINTA2)

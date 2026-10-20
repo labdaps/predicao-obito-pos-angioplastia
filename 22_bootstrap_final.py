@@ -4,7 +4,7 @@ Reamostra as pessoas do teste (2.000 réplicas, semente fixa) e recalcula, nas m
 os modelos de todas as partes, de modo que todas as diferenças são pareadas. Gera:
   - métricas com IC95% de cada modelo em cada parte;
   - diferenças par a par entre os seis modelos na análise principal (40 preditores);
-  - análise principal contra comparadores (variáveis do CathPCI e do Mayo, escore CathPCI publicado);
+  - análise principal contra comparadores (variáveis do CathPCI e do Mayo, escores CathPCI e Mayo publicados);
   - cada sensibilidade contra a análise principal, mesmo modelo;
   - desempenho por estrato urgente/eletivo e no subconjunto do teste com os 7 exames (análise principal e treino com casos completos).
 
@@ -43,6 +43,11 @@ for parte, pasta in PARTES.items():
     assert (t["id"].to_numpy() == ids).all() and (t[col_y].to_numpy() == y).all()
     for mcol in [c for c in t.columns if c not in ("id", DESF, "obito_30d")]:
         probs[(parte, mcol)] = t[mcol].to_numpy(dtype=float)
+
+# escore Mayo publicado (26_escore_mayo.py), mesmo teste
+_mayo = pd.read_csv(G / "resultados_mayo" / "probs_mayo_publicado.csv").set_index("id").loc[ids]
+assert (_mayo["obito_30d"].to_numpy() == y).all()
+probs[("mayo", "Mayo (escore publicado)")] = _mayo["Mayo (escore publicado)"].to_numpy(dtype=float)
 
 te = ds.set_index("id").loc[ids]
 EXAMES = ["creatinina", "hemoglobina", "leucocitos", "plaquetas", "potassio", "sodio", "ureia"]
@@ -106,6 +111,8 @@ for m in MODELOS:
     comps.append(("principal contra variáveis do Mayo", m, ("principal", m), ("mayo", m)))
     comps.append(("principal contra escore CathPCI publicado", m, ("principal", m), ("cathpci", "CathPCI (escore publicado)")))
     comps.append(("variáveis do CathPCI contra escore publicado", m, ("cathpci", m), ("cathpci", "CathPCI (escore publicado)")))
+    comps.append(("principal contra escore Mayo publicado", m, ("principal", m), ("mayo", "Mayo (escore publicado)")))
+    comps.append(("variáveis do Mayo contra escore publicado", m, ("mayo", m), ("mayo", "Mayo (escore publicado)")))
     for sens in ("sem_idade", "vespera", "casos_completos"):
         comps.append((f"{sens} contra principal", m, (sens, m), ("principal", m)))
 lin_d = []
