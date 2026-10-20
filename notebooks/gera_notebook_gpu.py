@@ -17,7 +17,7 @@ import nbformat as nbf
 #        mayo       7 variáveis do Mayo Clinic Risk Score
 SHAP_KUMO = "--shap-kumo" in sys.argv
 CONJUNTO = sys.argv[sys.argv.index("--conjunto") + 1] if "--conjunto" in sys.argv else "originais"
-assert CONJUNTO in ("originais", "expandido", "cathpci", "mayo"), CONJUNTO
+assert CONJUNTO in ("originais", "expandido", "cathpci", "mayo", "sem_idade", "vespera", "casos_completos"), CONJUNTO
 _args = [a for i, a in enumerate(sys.argv[1:], 1) if a not in ("--shap-kumo", "--conjunto") and sys.argv[i - 1] != "--conjunto"]
 if CONJUNTO != "originais":
     _padrao = f"ICP_modelos_{CONJUNTO}.ipynb"
@@ -28,6 +28,9 @@ saida = Path(_args[0]) if _args else Path(__file__).parent / _padrao
 DESCRICAO_CONJUNTO = {
     "expandido": "os 30 preditores originais mais 10 variáveis novas, todas registradas antes de t0: frequência cardíaca, pressão sistólica e diastólica, Glasgow, qSOFA, NEWS2, insuficiência cardíaca e droga vasoativa do formulário SAPS3, fração de ejeção (regex no laudo de ecocardiograma) e dias desde o eco",
     "cathpci": "as 8 variáveis do NCDR CathPCI de beira de leito (Peterson et al., JACC 2010): idade, choque, insuficiência cardíaca, doença arterial periférica, doença pulmonar crônica, filtração glomerular, infarto com supra e status do procedimento. NYHA IV não existe no dado. O escore publicado entra como comparador, sem treino",
+    "sem_idade": "análise de sensibilidade: o conjunto principal de 40 preditores sem a idade",
+    "vespera": "análise de sensibilidade: o conjunto principal de 40 preditores, com os exames laboratoriais restritos aos coletados até a véspera da angioplastia",
+    "casos_completos": "análise de sensibilidade: o conjunto principal de 40 preditores, com o treino restrito às pessoas com os 7 exames laboratoriais",
     "mayo": "as 7 variáveis do Mayo Clinic Risk Score (Singh et al., Mayo Clin Proc 2007): idade, creatinina, fração de ejeção, choque, infarto nas 24 h anteriores, insuficiência cardíaca e doença arterial periférica. O escore em pontos não é calculado (tabela de pontuação não conferida)",
 }
 BLOCO_PREDITORES = '''
@@ -51,9 +54,23 @@ df["status_icp"] = np.select([_emerg, (df["atend_48h_antes"] == 1) | (df["apres_
 #infarto nas 24 h anteriores: angioplastia primária, ou infarto com até 1 dia de internação
 df["iam_24h"] = (_emerg | ((df["apres_iam_qualquer"] == 1) & (df["dias_internacao_ate_icp"].fillna(0) <= 1))).astype(float)
 _novas = ["fc", "pas", "pad", "glasgow", "qsofa_max", "news2_max", "saps3_ic", "saps3_dva", "fe", "fe_dias"]
+_base40 = _originais + _novas
+EXAMES = ["creatinina", "hemoglobina", "leucocitos", "plaquetas", "potassio", "sodio", "ureia"]
+if "__CONJUNTO__" == "vespera":
+  #exames só até a véspera: troca os valores laboratoriais pelos da versão restrita (mesmo ID) e refaz o percentil da troponina
+  _vesp = pd.read_csv("icp_dataset_vespera.csv" if Path("icp_dataset_vespera.csv").exists() else "../dados/icp_dataset_vespera.csv")
+  _vesp.columns = _vesp.columns.str.lower(); _vesp = _vesp.set_index("id")
+  for _c in EXAMES + ["troponina_valor", "troponina_codigo"]:
+    df[_c] = df["id"].map(_vesp[_c])
+  troponina_pct_treino(df, treino)
+if "__CONJUNTO__" == "casos_completos":
+  #treino só com quem tem os 7 exames; o teste continua inteiro (e o subconjunto completo é avaliado à parte)
+  teste_completo = df.loc[teste, EXAMES].notna().all(axis=1).to_numpy()
+  treino = treino & df[EXAMES].notna().all(axis=1).to_numpy()
 preditores = {"cathpci": ["idade", "choque", "ic", "dap", "dpoc", "tfg", "stemi", "status_icp"],
               "mayo": ["idade", "creatinina", "fe", "choque", "iam_24h", "ic", "dap"],
-              "expandido": _originais + _novas}["__CONJUNTO__"]
+              "expandido": _base40, "vespera": _base40, "casos_completos": _base40,
+              "sem_idade": [c for c in _base40 if c != "idade"]}["__CONJUNTO__"]
 print("Conjunto: __CONJUNTO__ |", len(preditores), "preditores:", preditores)
 '''.replace("__CONJUNTO__", CONJUNTO)
 cells = []
@@ -68,11 +85,12 @@ def code(s):
 
 
 md("""
-# Óbito intra-hospitalar em até 30 dias após angioplastia — modelos clássicos e fundacionais (GPU)
+# Óbito na internação da angioplastia (até 30 dias) — modelos clássicos e fundacionais
 
 - **Dado:** `icp_dataset.csv`, 1 linha por pessoa (primeira angioplastia), **sem identificadores** (ID pseudonimizado).
-- **Desenho:** treino = angioplastias de 2024–2025; teste = 2026; nenhuma pessoa nos dois lados; transferidos externos fora.
-- **Modelos:** regressão logística (referência), gradient boosting (principal, pré-especificado), XGBoost, CatBoost, TabPFN e Kumo Tabular (exploratório).
+- **Desfecho:** óbito na internação da angioplastia (atendimentos a até 12 horas um do outro = mesma internação), em até 30 dias.
+- **Desenho:** treino = 2023–2024; teste = 2025; nenhuma pessoa nos dois conjuntos; transferidos externos fora.
+- **Modelos, em pé de igualdade:** regressão logística, gradient boosting, XGBoost, CatBoost, TabPFN e Kumo Tabular (este último sem descrição revisada por pares).
 - **Sem vazamento:** nenhum ajuste usa o teste. Regressão logística, gradient boosting, XGBoost e CatBoost têm hiperparâmetros otimizados por **Optuna** com validação cruzada estratificada de 5 folds **só no treino**. Os três de boosting aceitam ausentes nativamente (sem imputação); a regressão logística usa imputação pela mediana com indicador de ausente e padronização, **ajustadas dentro de cada fold** (pipeline). Os modelos fundacionais usam o treino como contexto e não têm tuning.
 - **Métricas:** valores pontuais no teste (sem bootstrap).
 - **Calibração:** todos os modelos são recalibrados (intercepto e inclinação no logit) com predições **fora da amostra do treino** (os mesmos 5 folds). O teste não entra.
@@ -95,10 +113,11 @@ SAIDA = Path("../resultados/modelos_paper") if Path("../resultados").exists() el
 SAIDA.mkdir(exist_ok=True)
 
 #mesmas constantes dos scripts do projeto
-DESFECHO, ANO, ANO_TESTE, SEMENTE = "obito_30d", "ano_icp", 2026, 20260929
+DESFECHO, ANO, ANO_TESTE, SEMENTE = "obito_internacao_30d", "ano_icp", 2025, 20260929
 #análise de sensibilidade: variáveis retiradas dos preditores (ex.: ["idade"]); vazio = análise principal
 VARIAVEIS_EXCLUIDAS = []
-FORA = ["id", DESFECHO, ANO, "mes_icp", "transf_externa_30d"] + VARIAVEIS_EXCLUIDAS
+#fora dos preditores: identificador, desfecho, período, a definição antiga de desfecho e a troponina bruta (vira percentil só do treino)
+FORA = ["id", DESFECHO, ANO, "mes_icp", "transf_externa_30d", "obito_30d", "troponina_pct_no_codigo", "troponina_valor", "troponina_codigo"] + VARIAVEIS_EXCLUIDAS
 NUM_ESTIMATORS_KUMO = 8
 N_TRIALS_OPTUNA = 50      # tentativas por modelo clássico
 N_FOLDS = 5               # validação cruzada estratificada, só no treino
@@ -196,11 +215,26 @@ n_total = len(df)
 #transferidos para hospital externo: desfecho não observado
 df = df[df["transf_externa_30d"] != 1].reset_index(drop=True)
 
-#hold-out por pessoa e por ano
+#coorte: angioplastias de 2023 a 2025
+df = df[df[ANO].between(2023, ANO_TESTE)].reset_index(drop=True)
+
+#hold-out por pessoa e por período: treino 2023–2024; teste 2025
 assert df["id"].is_unique, "ID repetido: o dataset não está no grão de pessoa"
-treino, teste = (df[ANO] < ANO_TESTE).to_numpy(), (df[ANO] >= ANO_TESTE).to_numpy()
+treino = (df[ANO] < ANO_TESTE).to_numpy()
+teste = (df[ANO] == ANO_TESTE).to_numpy()
 sobreposicao = len(set(df.loc[treino, "id"]) & set(df.loc[teste, "id"]))
 assert sobreposicao == 0
+
+def troponina_pct_treino(d, mascara_treino):
+  '''Percentil da troponina dentro do código do exame, contra a distribuição do TREINO (o teste não entra).'''
+  d["troponina_pct"] = np.nan
+  ref_tr = d.loc[mascara_treino & d["troponina_valor"].notna().to_numpy()]
+  for cod, g in ref_tr.groupby("troponina_codigo"):
+    ref = np.sort(g["troponina_valor"].to_numpy(dtype=float))
+    m = ((d["troponina_codigo"] == cod) & d["troponina_valor"].notna()).to_numpy()
+    d.loc[m, "troponina_pct"] = np.searchsorted(ref, d.loc[m, "troponina_valor"].to_numpy(dtype=float), side="right") / len(ref)
+
+troponina_pct_treino(df, treino)
 
 preditores = [c for c in df.columns if c not in FORA]
 X = df[preditores].astype(float)
@@ -355,7 +389,7 @@ except Exception as e:
   print("TabPFN falhou:", repr(e))
 """)
 
-md("## 6) Kumo Tabular (exploratório)")
+md("## 6) Kumo Tabular")
 md("""
 → Anunciado em 29/09/2026, sem revisão por pares; pesos sob OpenMDW-1.1. API do model card do Hugging Face.
 
@@ -457,7 +491,7 @@ md("""
 
 → A recalibração é monotônica: **não muda AUROC nem AUPRC**, só o valor da probabilidade. O SHAP continua explicando a saída original do modelo.
 
-→ **O que ela não resolve:** a prevalência do teste (2026) é maior que a do treino. Nenhuma recalibração feita só com o treino corrige essa mudança no tempo.
+→ **O que ela não resolve:** a prevalência do desfecho pode mudar entre o treino (2023–2024) e o teste (2025). Nenhuma recalibração feita só com o treino corrige essa mudança no tempo.
 """)
 code("""
 from sklearn.model_selection import cross_val_predict
@@ -498,13 +532,14 @@ if "Kumo Tabular" in probs_brutas:
   except Exception as e:
     erros["Recalibração do Kumo"] = repr(e)
 
-probs, linhas_rec = {}, []
+probs, linhas_rec, recal_params = {}, [], {}
 for nome, p_bruta in probs_brutas.items():
   if nome not in oof:
     probs[nome] = p_bruta          # sem OOF: fica sem recalibrar (o motivo está em `erros`)
     continue
   rec = LogisticRegression(C=1e6, max_iter=1000).fit(logit(oof[nome]).reshape(-1, 1), ytr)
   a, b = float(rec.intercept_[0]), float(rec.coef_[0][0])
+  recal_params[nome] = (a, b)
   probs[nome] = 1 / (1 + np.exp(-(a + b * logit(p_bruta))))
   i0, s0 = calibracao(yte, p_bruta)
   i1, s1 = calibracao(yte, probs[nome])
@@ -551,7 +586,7 @@ for nome, p in probs.items():
 ax.plot([0, 1], [0, 1], ls="--", color="gray", lw=1, label="Aleatório")
 ax.set_xlabel("1 − Especificidade (taxa de falsos positivos)")
 ax.set_ylabel("Sensibilidade (taxa de verdadeiros positivos)")
-ax.set_title(f"Curvas ROC — teste: jan–jul/2026 (n = {len(yte)}, {yte.sum()} óbitos)")
+ax.set_title(f"Curvas ROC — teste: 2025 (n = {len(yte)}, {yte.sum()} óbitos)")
 ax.set_xlim(0, 1); ax.set_ylim(0, 1.01); ax.set_aspect("equal")
 ax.legend(loc="lower right", frameon=False)
 ax.grid(alpha=0.3)
@@ -572,189 +607,110 @@ limite = 100 * max(0.30, max(p[np.argsort(p)[-len(p) // 10:]].mean() for p in pr
 ax.plot([0, limite], [0, limite], ls="--", color="gray", lw=1, label="Calibração perfeita")
 ax.set_xlim(0, limite); ax.set_ylim(0, limite); ax.set_aspect("equal")
 ax.set_xlabel("Risco previsto médio no decil (%)"); ax.set_ylabel("Óbito observado no decil (%)")
-ax.set_title(f"Calibração — teste: jan–jul/2026 (n = {len(yte)}, {yte.sum()} óbitos)")
+ax.set_title(f"Calibração — teste: 2025 (n = {len(yte)}, {yte.sum()} óbitos)")
 ax.legend(loc="upper left", frameon=False); ax.grid(alpha=0.3); fig.tight_layout()
 fig.savefig(SAIDA / "calibracao.png", dpi=300)
 plt.show()
 """)
 
-md("## 7.2) SHAP do melhor modelo de árvore")
-md("""
-→ **Qual modelo:** o de maior AUROC na **validação cruzada do treino** entre XGBoost e CatBoost (a escolha não olha o teste). Os dois têm TreeSHAP exato embutido, sem depender da biblioteca `shap`.
+if CONJUNTO == "expandido":
+    md("## 7.2) SHAP do modelo com maior AUROC no teste")
+    md("""
+→ **Qual modelo:** o de maior AUROC no teste entre os seis. A escolha é só para a explicação; não altera nenhuma métrica.
 
-→ **Por que não o Kumo nem o TabPFN:** eles não têm SHAP exato; a aproximação por permutação exigiria centenas de inferências (cada uma leva ~30 minutos em CPU no Kumo).
+→ **Como:** XGBoost e CatBoost têm TreeSHAP exato (todas as pessoas do teste). Para os demais, o valor de Shapley é **estimado por amostragem de permutações** (Štrumbelj e Kononenko, 2014) em 200 pessoas do teste, 20 permutações cada, com pessoas de referência sorteadas do treino.
 
-→ Os valores SHAP são calculados nas pessoas do **teste**, em log-odds. Positivo = empurra a predição para óbito.
+→ Escala em **log-odds** da saída original do modelo (antes da recalibração). Positivo = empurra a predição para óbito.
 """)
-code("""
+    code("""
+import time
 from catboost import Pool
 import xgboost as xgb
 
-candidatos = [m for m in ["XGBoost", "CatBoost"] if m in modelos]
-MODELO_SHAP = max(candidatos, key=lambda m: hiperparametros[m]["auroc_cv_treino"])
-if MODELO_SHAP == "CatBoost":
-  contrib = modelos[MODELO_SHAP].get_feature_importance(Pool(Xte_np), type="ShapValues")
+N_SHAP, K_PERM, LOTE = 200, 20, 2500
+candidatos = [m for m in probs_brutas if m != "CathPCI (escore publicado)"]
+MODELO_SHAP = max(candidatos, key=lambda m: roc_auc_score(yte, probs_brutas[m]))
+print("Modelo do SHAP (maior AUROC no teste):", MODELO_SHAP, f"| AUROC {roc_auc_score(yte, probs_brutas[MODELO_SHAP]):.4f}")
+
+def f_logodds(Xn):
+  #log-odds da saída original do modelo escolhido, em lotes
+  partes = []
+  for ini in range(0, len(Xn), LOTE):
+    bloco = Xn[ini:ini + LOTE]
+    if MODELO_SHAP == "TabPFN":
+      p = tabpfn.predict_proba(pd.DataFrame(bloco, columns=preditores))[:, list(tabpfn.classes_).index(1)]
+    elif MODELO_SHAP == "Kumo Tabular":
+      p = probabilidade_obito(kumo_prever(Xtr, ytr, pd.DataFrame(bloco, columns=preditores)), ytr.mean(), n_esperado=len(bloco), verboso=False)
+    else:
+      p = modelos[MODELO_SHAP].predict_proba(bloco)[:, 1]
+    partes.append(p)
+  return logit(np.concatenate(partes))
+
+if MODELO_SHAP in ("XGBoost", "CatBoost"):
+  if MODELO_SHAP == "CatBoost":
+    contrib = modelos[MODELO_SHAP].get_feature_importance(Pool(Xte_np), type="ShapValues")
+  else:
+    contrib = modelos[MODELO_SHAP].get_booster().predict(xgb.DMatrix(Xte_np), pred_contribs=True)
+  shap_valores, X_ref = contrib[:, :-1], Xte_np
+  p_shap = 1 / (1 + np.exp(-(contrib[:, -1] + shap_valores.sum(axis=1))))
+  assert np.allclose(p_shap, probs_brutas[MODELO_SHAP], atol=1e-4), "SHAP não reconstitui a predição"
 else:
-  contrib = modelos[MODELO_SHAP].get_booster().predict(xgb.DMatrix(Xte_np), pred_contribs=True)
-shap_valores, shap_base = contrib[:, :-1], contrib[:, -1]
+  rng_shap = np.random.default_rng(SEMENTE)
+  idx_shap = np.sort(rng_shap.choice(len(Xte_np), size=min(N_SHAP, len(Xte_np)), replace=False))
+  X_ref = Xte_np[idx_shap]
+  n_exp, n_var = X_ref.shape
+  f_exp = f_logodds(X_ref)
+  print(f"Diferença máxima (log-odds) entre predizer em lote e no teste inteiro: {np.abs(f_exp - logit(probs_brutas[MODELO_SHAP][idx_shap])).max():.4f}")
+  shap_valores, f_fundo = np.zeros((n_exp, n_var)), np.zeros(n_exp)
+  for k in range(K_PERM):
+    t_ini = time.time()
+    ordem = rng_shap.permutation(n_var)
+    atual = Xtr_np[rng_shap.integers(0, len(Xtr_np), size=n_exp)].copy()     # referências sorteadas do TREINO
+    passos = [atual.copy()]
+    for j in ordem:
+      atual[:, j] = X_ref[:, j]
+      passos.append(atual.copy())
+    f = f_logodds(np.vstack(passos)).reshape(n_var + 1, n_exp)
+    for pos, j in enumerate(ordem):
+      shap_valores[:, j] += f[pos + 1] - f[pos]
+    f_fundo += f[0]
+    if k == 0:
+      print(f"1ª permutação: {time.time() - t_ini:.0f}s -> estimativa total: {(time.time() - t_ini) * K_PERM / 60:.0f} min")
+  shap_valores /= K_PERM; f_fundo /= K_PERM
+  print("Erro máximo de aditividade (log-odds):", np.abs(shap_valores.sum(axis=1) - (f_exp - f_fundo)).max())
 
-#conferência: base + soma dos SHAP = log-odds previsto pelo modelo
-p_shap = 1 / (1 + np.exp(-(shap_base + shap_valores.sum(axis=1))))
-assert np.allclose(p_shap, probs_brutas[MODELO_SHAP], atol=1e-4), "SHAP não reconstitui a predição"
-
-importancia = pd.DataFrame({"variavel": preditores, "shap_medio_abs": np.abs(shap_valores).mean(axis=0)}) \
-                .sort_values("shap_medio_abs", ascending=False).reset_index(drop=True)
+importancia = pd.DataFrame({"variavel": preditores, "shap_medio_abs": np.abs(shap_valores).mean(axis=0)})
+importancia = importancia.sort_values("shap_medio_abs", ascending=False).reset_index(drop=True)
 importancia.to_csv(SAIDA / "shap_importancia.csv", index=False)
-print("Modelo do SHAP:", MODELO_SHAP)
 print(importancia.head(15).to_string(index=False))
 """)
-code("""
+    code("""
 TOP = 15
 topo = importancia.head(TOP)
 
 fig, ax = plt.subplots(figsize=(7, 6))
-ax.barh(topo["variavel"][::-1], topo["shap_medio_abs"][::-1], color="#1f77b4")
+ax.barh(topo["variavel"][::-1], topo["shap_medio_abs"][::-1], color=cores.get(MODELO_SHAP, "#1f77b4"))
 ax.set_xlabel("Média de |SHAP| (log-odds)")
-ax.set_title(f"Importância por SHAP — {MODELO_SHAP} (teste, n = {len(yte)})")
-fig.tight_layout()
-fig.savefig(SAIDA / "shap_importancia.png", dpi=300)
-plt.show()
+ax.set_title(f"Importância por SHAP — {MODELO_SHAP} (teste, n = {len(X_ref)})")
+fig.tight_layout(); fig.savefig(SAIDA / "shap_importancia.png", dpi=300); plt.show()
 
 #beeswarm: cada ponto é uma pessoa; cor = valor da variável (percentil); cinza = ausente
 rng_plot = np.random.default_rng(SEMENTE)
 fig, ax = plt.subplots(figsize=(8, 7))
 for linha, var in enumerate(topo["variavel"][::-1]):
   j = preditores.index(var)
-  valor, sv = Xte_np[:, j], shap_valores[:, j]
+  valor, sv = X_ref[:, j], shap_valores[:, j]
   ausente = np.isnan(valor)
   jitter = linha + rng_plot.uniform(-0.3, 0.3, size=len(sv))
-  ax.scatter(sv[ausente], jitter[ausente], s=5, color="lightgray", alpha=0.6, linewidths=0)
+  ax.scatter(sv[ausente], jitter[ausente], s=6, color="lightgray", alpha=0.6, linewidths=0)
   percentil = pd.Series(valor[~ausente]).rank(pct=True).to_numpy()
-  pontos = ax.scatter(sv[~ausente], jitter[~ausente], s=5, c=percentil, cmap="coolwarm", vmin=0, vmax=1, alpha=0.7, linewidths=0)
+  pontos = ax.scatter(sv[~ausente], jitter[~ausente], s=6, c=percentil, cmap="coolwarm", vmin=0, vmax=1, alpha=0.7, linewidths=0)
 ax.axvline(0, color="gray", lw=1)
 ax.set_yticks(range(len(topo))); ax.set_yticklabels(topo["variavel"][::-1])
 ax.set_xlabel("SHAP (log-odds; positivo = maior risco de óbito)")
-ax.set_title(f"SHAP — {MODELO_SHAP} (teste, n = {len(yte)})")
+ax.set_title(f"SHAP — {MODELO_SHAP} (teste, n = {len(X_ref)})")
 barra = fig.colorbar(pontos, ax=ax, ticks=[0, 1]); barra.ax.set_yticklabels(["baixo", "alto"]); barra.set_label("Valor da variável (cinza = ausente)")
-fig.tight_layout()
-fig.savefig(SAIDA / "shap_beeswarm.png", dpi=300)
-plt.show()
-""")
-
-if SHAP_KUMO:
-    md("## 7.3) SHAP aproximado do Kumo Tabular (só com GPU)")
-    md("""
-→ O Kumo não tem SHAP exato. Aqui o valor de Shapley é **estimado por amostragem de permutações** (Štrumbelj e Kononenko, 2014): para cada pessoa explicada, parte-se de uma pessoa de referência sorteada do **treino** e trocam-se as variáveis, uma a uma em ordem aleatória, pelos valores da pessoa explicada. A mudança na predição a cada troca é a contribuição daquela variável; a média sobre as permutações é o SHAP.
-
-→ Escala em **log-odds**, como no SHAP das árvores. Por construção, a soma dos SHAP de uma pessoa é igual à predição dela menos a média das predições das referências.
-
-→ **Custo:** `N_SHAP_KUMO × K_PERM_KUMO × (variáveis + 1)` linhas de consulta. Com os valores abaixo são 124 mil linhas (cerca de 46 vezes o teste). A primeira permutação imprime o tempo, para estimar o total.
-
-→ É uma **estimativa com ruído de Monte Carlo**: variáveis com SHAP pequeno podem trocar de posição entre sementes. O ranking do topo é o que se interpreta.
-""")
-    code("""
-import time
-
-N_SHAP_KUMO = 200     # pessoas do teste explicadas (amostra aleatória, semente fixa)
-K_PERM_KUMO = 20      # permutações por pessoa
-LOTE_KUMO = 2500      # linhas de consulta por chamada do modelo (reduza se faltar memória na GPU)
-
-def grafico_shap(valores, X_ref, nome_modelo, prefixo, top=15):
-  imp = pd.DataFrame({"variavel": preditores, "shap_medio_abs": np.abs(valores).mean(axis=0)})
-  imp = imp.sort_values("shap_medio_abs", ascending=False).reset_index(drop=True)
-  imp.to_csv(SAIDA / f"{prefixo}_importancia.csv", index=False)
-  topo = imp.head(top)
-
-  fig, ax = plt.subplots(figsize=(7, 6))
-  ax.barh(topo["variavel"][::-1], topo["shap_medio_abs"][::-1], color="#d62728")
-  ax.set_xlabel("Média de |SHAP| (log-odds)")
-  ax.set_title(f"Importância por SHAP — {nome_modelo} (teste, n = {len(valores)})")
-  fig.tight_layout(); fig.savefig(SAIDA / f"{prefixo}_importancia.png", dpi=300); plt.show()
-
-  rng_plot = np.random.default_rng(SEMENTE)
-  fig, ax = plt.subplots(figsize=(8, 7))
-  for linha, var in enumerate(topo["variavel"][::-1]):
-    j = preditores.index(var)
-    valor, sv = X_ref[:, j], valores[:, j]
-    ausente = np.isnan(valor)
-    jitter = linha + rng_plot.uniform(-0.3, 0.3, size=len(sv))
-    ax.scatter(sv[ausente], jitter[ausente], s=8, color="lightgray", alpha=0.7, linewidths=0)
-    percentil = pd.Series(valor[~ausente]).rank(pct=True).to_numpy()
-    pontos = ax.scatter(sv[~ausente], jitter[~ausente], s=8, c=percentil, cmap="coolwarm", vmin=0, vmax=1, alpha=0.8, linewidths=0)
-  ax.axvline(0, color="gray", lw=1)
-  ax.set_yticks(range(len(topo))); ax.set_yticklabels(topo["variavel"][::-1])
-  ax.set_xlabel("SHAP (log-odds; positivo = maior risco de óbito)")
-  ax.set_title(f"SHAP — {nome_modelo} (teste, n = {len(valores)})")
-  barra = fig.colorbar(pontos, ax=ax, ticks=[0, 1]); barra.ax.set_yticklabels(["baixo", "alto"]); barra.set_label("Valor da variável (cinza = ausente)")
-  fig.tight_layout(); fig.savefig(SAIDA / f"{prefixo}_beeswarm.png", dpi=300); plt.show()
-  return imp
-
-try:
-  if "Kumo Tabular" not in probs:
-    raise RuntimeError("o Kumo não rodou na seção 6")
-  if dispositivo_kumo != "cuda":
-    raise RuntimeError("SHAP do Kumo só com GPU: em CPU cada chamada leva dezenas de minutos")
-
-  stypes_kumo = sdm.infer_stypes(tabela_df, overrides={"target": "categorical"})
-
-  def kumo_logodds(X_consulta):
-    '''Log-odds de óbito do Kumo para um array de linhas de consulta; o contexto é sempre o treino inteiro.'''
-    partes = []
-    for ini in range(0, len(X_consulta), LOTE_KUMO):
-      bloco = pd.DataFrame(X_consulta[ini:ini + LOTE_KUMO], columns=preditores).assign(target=np.nan)
-      tb = sdm.TableTensor.from_pandas(df=pd.concat([ctx, bloco], ignore_index=True), stypes=stypes_kumo, device=dispositivo_kumo)
-      fixa_sementes()
-      g = torch.Generator(device=dispositivo_kumo).manual_seed(SEMENTE)
-      with torch.no_grad():
-        s = kumo(x_context=tb[:n_ctx].drop_columns("target"), y_context=tb[:n_ctx, "target"],
-                 x_query=tb[n_ctx:].drop_columns("target"), num_estimators=NUM_ESTIMATORS_KUMO, generator=g)
-      t = s.to_pandas()
-      coluna = [c for c in t.columns if str(c).strip() in ("1", "1.0")][0]
-      partes.append(t[coluna].to_numpy(dtype=float))
-    p = np.clip(np.concatenate(partes), 1e-6, 1 - 1e-6)
-    return np.log(p / (1 - p))
-
-  rng_shap = np.random.default_rng(SEMENTE)
-  idx_shap = np.sort(rng_shap.choice(len(Xte_np), size=min(N_SHAP_KUMO, len(Xte_np)), replace=False))
-  X_exp = Xte_np[idx_shap]
-  n_exp, n_var = X_exp.shape
-
-  #conferência: a predição de uma pessoa não pode depender de quais outras linhas estão na consulta
-  p_ref = np.clip(probs_brutas["Kumo Tabular"][idx_shap], 1e-6, 1 - 1e-6)
-  f_exp = kumo_logodds(X_exp)
-  dif_lote = np.abs(f_exp - np.log(p_ref / (1 - p_ref))).max()
-  print(f"Diferença máxima (log-odds) entre predizer em lote pequeno e no teste inteiro: {dif_lote:.4f}")
-  if dif_lote > 0.05:
-    print("ATENÇÃO: a predição do Kumo muda com a composição da consulta; interpretar o SHAP com cautela")
-
-  shap_kumo = np.zeros((n_exp, n_var))
-  f_fundo = np.zeros(n_exp)
-  for k in range(K_PERM_KUMO):
-    t0 = time.time()
-    ordem = rng_shap.permutation(n_var)
-    atual = Xtr_np[rng_shap.integers(0, len(Xtr_np), size=n_exp)].copy()   # referências sorteadas do TREINO
-    passos = [atual.copy()]
-    for j in ordem:
-      atual[:, j] = X_exp[:, j]
-      passos.append(atual.copy())
-    f = kumo_logodds(np.vstack(passos)).reshape(n_var + 1, n_exp)
-    for pos, j in enumerate(ordem):
-      shap_kumo[:, j] += f[pos + 1] - f[pos]
-    f_fundo += f[0]
-    if k == 0:
-      print(f"1ª permutação: {time.time() - t0:.0f}s -> estimativa total: {(time.time() - t0) * K_PERM_KUMO / 60:.0f} min")
-  shap_kumo /= K_PERM_KUMO
-  f_fundo /= K_PERM_KUMO
-
-  #soma dos SHAP = predição da pessoa - média das predições das referências (vale por construção)
-  print("Erro máximo de aditividade (log-odds):", np.abs(shap_kumo.sum(axis=1) - (f_exp - f_fundo)).max())
-
-  pd.DataFrame(shap_kumo, columns=preditores).assign(id=ids_teste[idx_shap]).to_csv(SAIDA / "shap_kumo_valores.csv", index=False)
-  importancia_kumo = grafico_shap(shap_kumo, X_exp, "Kumo Tabular", "shap_kumo")
-  print(importancia_kumo.head(15).to_string(index=False))
-except Exception as e:
-  erros["SHAP do Kumo"] = repr(e)
-  print("SHAP do Kumo falhou:", repr(e))
+fig.tight_layout(); fig.savefig(SAIDA / "shap_beeswarm.png", dpi=300); plt.show()
 """)
 
 md("## 7.4) Ponto de operação: limiar = prevalência do treino")
@@ -813,7 +769,7 @@ ax.axhline(0, color="gray", lw=1, ls="--", label="Não vigiar ninguém")
 ax.axvline(100 * LIMIAR, color="gray", lw=1, ls="-.", label=f"Limiar do estudo ({100*LIMIAR:.1f}%)")
 ax.set_ylim(-0.005, prevalencia * 1.05)
 ax.set_xlabel("Limiar de risco (%)"); ax.set_ylabel("Benefício líquido")
-ax.set_title(f"Curva de decisão — teste: jan–jul/2026 (n = {len(yte)}, {yte.sum()} óbitos)")
+ax.set_title(f"Curva de decisão — teste: 2025 (n = {len(yte)}, {yte.sum()} óbitos)")
 ax.legend(frameon=False); ax.grid(alpha=0.3); fig.tight_layout()
 fig.savefig(SAIDA / "curva_decisao.png", dpi=300)
 plt.show()
@@ -891,11 +847,11 @@ def resumo(serie):
   return f"{med:.1f} [{q1:.1f}–{q3:.1f}]{ausente}"
 
 df_treino = df.loc[treino]
-linhas_t1 = [{"Característica": "Pessoas", "Treino (2024–2025)": len(df_treino), "Teste (jan–jul/2026)": len(df_teste)},
-             {"Característica": "Óbito intra-hospitalar em 30 dias", "Treino (2024–2025)": f"{ytr.sum()} ({100*ytr.mean():.2f}%)",
-              "Teste (jan–jul/2026)": f"{yte.sum()} ({100*yte.mean():.2f}%)"}]
+linhas_t1 = [{"Característica": "Pessoas", "Treino (2023–2024)": len(df_treino), "Teste (2025)": len(df_teste)},
+             {"Característica": "Óbito intra-hospitalar em 30 dias", "Treino (2023–2024)": f"{ytr.sum()} ({100*ytr.mean():.2f}%)",
+              "Teste (2025)": f"{yte.sum()} ({100*yte.mean():.2f}%)"}]
 for var in [c for c in df.columns if c not in ["id", DESFECHO, ANO, "mes_icp", "transf_externa_30d"]]:
-  linhas_t1.append({"Característica": var, "Treino (2024–2025)": resumo(df_treino[var]), "Teste (jan–jul/2026)": resumo(df_teste[var])})
+  linhas_t1.append({"Característica": var, "Treino (2023–2024)": resumo(df_treino[var]), "Teste (2025)": resumo(df_teste[var])})
 tab_t1 = pd.DataFrame(linhas_t1)
 print(tab_t1.to_string(index=False))
 """)
@@ -923,7 +879,7 @@ code("""
 import platform
 
 cabecalho = [
-  "# Óbito intra-hospitalar em até 30 dias após angioplastia — resultados",
+  "# Óbito na internação da angioplastia (até 30 dias) — resultados",
   "",
   f"- Dataset: {n_total}; transferidos excluídos: {n_total - len(df)}; preditores: {len(preditores)}"
   f"; variáveis excluídas (sensibilidade): {VARIAVEIS_EXCLUIDAS or 'nenhuma'}",
@@ -946,7 +902,7 @@ except ImportError:
 if erros:
   cabecalho += ["", "## Modelos que falharam", ""] + [f"- {k}: `{v}`" for k, v in erros.items()]
 
-texto = "\\n".join(cabecalho) + "\\n\\n## Métricas no teste (jan–jul/2026)\\n\\n" + metricas + \\
+texto = "\\n".join(cabecalho) + "\\n\\n## Métricas no teste (2025)\\n\\n" + metricas + \\
         "\\n## Diferenças entre modelos\\n\\n" + comparacao + "\\n## Otimização de hiperparâmetros (Optuna)\\n\\n" + otimizacao + \\
         "\\n## Recalibração com o treino (a e b da recalibração logística; efeito no teste)\\n\\n" + para_md(tab_rec) + \\
         f"\\n## Ponto de operação: limiar = prevalência do treino ({100*LIMIAR:.2f}%)\\n\\n" + para_md(tab_op) + \\
